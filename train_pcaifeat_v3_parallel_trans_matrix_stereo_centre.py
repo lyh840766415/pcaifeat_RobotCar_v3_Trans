@@ -1,14 +1,21 @@
 import tensorflow as tf
 import numpy as np
 from loading_input_v3 import *
-from pointnetvlad_v3.pointnetvlad_cls import *
+from pointnetvlad_v3.pointnetvlad_trans import *
 import pointnetvlad_v3.loupe as lp
-import nets_v3.resnet_v1_50 as resnet
+import nets_v3.resnet_v1_trans as resnet
 import shutil
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
 import time
 import cv2
+sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
+from camera_model import CameraModel
+from transform import build_se3_transform
+import numpy as np
+from image import load_image
+from scipy.ndimage import map_coordinates
+import matplotlib.pyplot as plt
 
 #thread pool
 pool = ThreadPool(10)
@@ -16,11 +23,11 @@ pool = ThreadPool(10)
 # is rand init 
 RAND_INIT = False
 # model path
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_cat/model_00258086.ckpt"
-PC_MODEL_PATH ="/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_cat/pc_model_00258086.ckpt"
-IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_cat_2/img_model_00210070.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_fusion/model_00180060.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_pc/pc_model_00174058.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_fusion_1/img_model_00348116.ckpt"
 # log path
-LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_cat_5"
+LOG_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_fusion_6"
 # 1 for point cloud only, 2 for image only, 3 for pc&img&fc
 TRAINING_MODE = 3
 #TRAIN_ALL = True
@@ -33,7 +40,7 @@ quadruplet = True
 # Epoch & Batch size &FINAL EMBBED SIZE & learning rate
 EPOCH = 20
 LOAD_BATCH_SIZE = 100
-FEAT_BARCH_SIZE = 1
+FEAT_BARCH_SIZE = 2
 LOAD_FEAT_RATIO = LOAD_BATCH_SIZE//FEAT_BARCH_SIZE
 EMBBED_SIZE = 1000
 BASE_LEARNING_RATE = 5e-5
@@ -58,9 +65,6 @@ TRAINING_QUERIES = get_queries_dict(TRAIN_FILE)
 #cur_load for get_batch_keys
 CUR_LOAD = 0
 
-#Train STEP
-STEP=0
-
 #multi threading share global variable
 TRAINING_DATA = []
 TRAINING_DATA_LOCK = threading.Lock()
@@ -70,7 +74,34 @@ cnt = 0
 LOAD_QUENE_SIZE = 10
 EP = 0
 
+#camera model and posture
+CAMERA_MODEL = None
+G_CAMERA_POSESOURCE = None
 
+
+
+def init_camera_model_posture():
+	global CAMERA_MODEL
+	global G_CAMERA_POSESOURCE
+	models_dir = "/data/lyh/lab/robotcar-dataset-sdk/models/"
+	CAMERA_MODEL = CameraModel(models_dir, "mono_left")
+	#read the camera and ins extrinsics
+	extrinsics_path = "/data/lyh/lab/robotcar-dataset-sdk/extrinsics/mono_left.txt"
+	print(extrinsics_path)
+	with open(extrinsics_path) as extrinsics_file:
+		extrinsics = [float(x) for x in next(extrinsics_file).split(' ')]
+	G_camera_vehicle = build_se3_transform(extrinsics)
+	print(G_camera_vehicle)
+	
+	extrinsics_path = "/data/lyh/lab/robotcar-dataset-sdk/extrinsics/ins.txt"
+	print(extrinsics_path)
+	with open(extrinsics_path) as extrinsics_file:
+		extrinsics = [float(x) for x in next(extrinsics_file).split(' ')]
+	G_ins_vehicle = build_se3_transform(extrinsics)
+	print(G_ins_vehicle)
+	G_CAMERA_POSESOURCE = G_camera_vehicle*G_ins_vehicle
+	
+	
 def get_learning_rate(epoch):
 	learning_rate = BASE_LEARNING_RATE*((0.9)**(epoch//5))
 	learning_rate = tf.maximum(learning_rate, 0.00001) # CLIP THE LEARNING RATE!
@@ -87,46 +118,66 @@ def get_bn_decay(step):
 	bn_decay = tf.minimum(BN_DECAY_CLIP, 1 - bn_momentum)
 	return bn_decay
 
-def init_imgnetwork():
+
+def init_imgnetwork(pc_trans_feat):
+	with tf.variable_scope("img_var"):
+		img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BARCH_SIZE*BATCH_DATA_SIZE,256,192,3])
+		img_feat, img_pc_feat = resnet.endpoints(img_placeholder,pc_trans_feat,is_training=True)
+	return img_placeholder, img_feat, img_pc_feat
+
+
+'''
+def init_imgnetwork(pc_trans_feat):	
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BARCH_SIZE*BATCH_DATA_SIZE,256,256,3])
-		img_feat_before_pooling, img_feat_after_pooling, body_prefix = resnet.endpoints(img_placeholder,is_training=True)
-		img_feat = tf.layers.dense(img_feat_after_pooling, EMBBED_SIZE,activation=tf.nn.relu)
-	return img_placeholder, img_feat_before_pooling, img_feat
-	
+		_,img_feat,_= resnet.endpoints(img_placeholder,is_training=True)
+		img_feat = tf.layers.dense(img_feat,1000,activation=tf.nn.relu)
+		img_feat = tf.nn.l2_normalize(img_feat,1)
+	return img_placeholder, img_feat, None
+'''
+		
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
 		pc_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BARCH_SIZE*BATCH_DATA_SIZE,4096,3])
+		trans_mat_placeholder = tf.placeholder(tf.float32,shape=[FEAT_BARCH_SIZE*BATCH_DATA_SIZE,64,4096])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat_after_shape = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
-		pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
-	return pc_placeholder,is_training_pl,pc_feat
+		pc_feat,pc_trans_feat = pointnetvlad(pc_placeholder,trans_mat_placeholder,is_training_pl,bn_decay)	
+	return pc_placeholder,is_training_pl,trans_mat_placeholder,pc_feat,pc_trans_feat
 	
 def init_fusion_network(pc_feat,img_feat):
 	with tf.variable_scope("fusion_var"):
 		concat_feat = tf.concat((pc_feat,img_feat),axis=1)
 		pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
-		print(pcai_feat)
 	return pcai_feat
 
 def init_pcainetwork():
 	#training step
 	step = tf.Variable(0)
-	
+	pc_trans_feat = None	
 	#init sub-network
 	if TRAINING_MODE != 2:
-		pc_placeholder, is_training_pl, pc_feat = init_pcnetwork(step)
+		pc_placeholder, is_training_pl, trans_mat_placeholder, pc_feat,pc_trans_feat = init_pcnetwork(step)
 	if TRAINING_MODE != 1:
-		img_placeholder, img_feat_before_pooling, img_feat = init_imgnetwork()
+		img_placeholder, img_feat, img_pc_feat = init_imgnetwork(pc_trans_feat)
+		img_feat = img_pc_feat
 	if TRAINING_MODE == 3:
-		pcai_feat = init_fusion_network(pc_feat,img_feat)
+		pcai_feat = init_fusion_network(pc_feat,img_pc_feat)
 	
 	'''
 	variables = tf.trainable_variables()
 	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
 	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
 	fusion_variable = [v for v in variables if v.name.split('/')[0] =='fusion_var']
+	
+	for var in pc_variable:
+		print(var)
+	for var in img_variable:
+		print(var)
+	for var in fusion_variable:
+		print(var)
+	exit()
+	
 	pc_variable_cnt = 0
 	for variable in pc_variable:
 		# shape is an array of tf.Dimension
@@ -179,9 +230,9 @@ def init_pcainetwork():
 		pcai_feat = tf.reshape(pcai_feat,[FEAT_BARCH_SIZE,BATCH_DATA_SIZE,pcai_feat.shape[1]])
 		q_vec, pos_vec, neg_vec, oth_vec = tf.split(pcai_feat, [1,POS_NUM,NEG_NUM,OTH_NUM],1)
 		finally_loss = lazy_quadruplet_loss(q_vec, pos_vec, neg_vec, oth_vec, MARGIN1, MARGIN2)
-		all_loss = pc_loss*2+img_loss+finally_loss
-		tf.summary.scalar('all_loss', all_loss)
+		all_loss = finally_loss + 2*pc_loss + img_loss
 		tf.summary.scalar('finally_loss', finally_loss)
+		tf.summary.scalar('all_loss', all_loss)
 		
 	#learning rate strategy, all in one?
 	epoch_num_placeholder = tf.placeholder(tf.float32, shape=())
@@ -198,15 +249,6 @@ def init_pcainetwork():
 		with tf.control_dependencies(fusion_ops):
 			fusion_train_op = optimizer.minimize(all_loss, global_step=step)
 	
-	variables = tf.trainable_variables()
-	#for var in variables:
-	#	print(var)
-	
-	pc_train_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
-	img_train_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
-	fusion_variable = [v for v in variables if v.name.split('/')[0] =='fusion_var']
-	pc_img_variable = pc_train_variable + img_train_variable
-	
 	#training operation
 	with tf.control_dependencies(update_ops):
 		if TRAINING_MODE != 2:
@@ -214,9 +256,9 @@ def init_pcainetwork():
 		if TRAINING_MODE != 1:
 			img_train_op = optimizer.minimize(img_loss, global_step=step)
 		if TRAINING_MODE == 3:
-			pc_img_train_op = optimizer.minimize(pc_loss+img_loss, global_step=step,var_list=pc_img_variable)			
-			fusion_train_op = optimizer.minimize(finally_loss, global_step=step,var_list=fusion_variable)
 			all_train_op = optimizer.minimize(all_loss, global_step=step)
+	
+	
 	
 	#merged all log variable
 	merged = tf.summary.merge_all()
@@ -248,6 +290,7 @@ def init_pcainetwork():
 			"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"img_placeholder":img_placeholder,
+			"trans_mat_placeholder":trans_mat_placeholder,
 			"epoch_num_placeholder":epoch_num_placeholder,
 			"pc_loss":pc_loss,
 			"img_loss":img_loss,
@@ -265,6 +308,7 @@ def init_pcainetwork():
 			"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"img_placeholder":img_placeholder,
+			"trans_mat_placeholder":trans_mat_placeholder,
 			"epoch_num_placeholder":epoch_num_placeholder,
 			"pc_loss":pc_loss,
 			"img_loss":img_loss,
@@ -272,8 +316,6 @@ def init_pcainetwork():
 			"pc_train_op":pc_train_op,
 			"img_train_op":img_train_op,
 			"all_train_op":all_train_op,
-			"pc_img_train_op":pc_img_train_op,
-			"fusion_train_op":fusion_train_op,
 			"merged":merged,
 			"step":step}
 		return ops
@@ -304,10 +346,10 @@ def init_network_variable(sess,train_saver):
 		return
 	
 	if TRAINING_MODE == 3:
-		train_saver['all_saver'].restore(sess,MODEL_PATH)
-		print("all_model restored")
-		train_saver['pc_saver'].restore(sess,PC_MODEL_PATH)
-		print("pc_model restored")
+		#train_saver['all_saver'].restore(sess,MODEL_PATH)
+		#print("all_model restored")
+		#train_saver['pc_saver'].restore(sess,PC_MODEL_PATH)
+		#print("pc_model restored")
 		train_saver['img_saver'].restore(sess,IMG_MODEL_PATH)
 		print("img_model restored")
 		
@@ -317,19 +359,15 @@ def init_train_saver():
 	all_saver = tf.train.Saver()
 	variables = tf.contrib.framework.get_variables_to_restore()
 	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
-	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
-	#img_variable = [v for v in variables if v.name.split('/')[0] =='img_var' and v.name.split('/')[1] == 'resnet_v1_50']
+	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var' and v.name.split('/')[1] == 'resnet_v1_50']
 	
-	#for var in img_variable:
-	#	print(var)
-	#exit()
-
 	pc_saver = None
 	img_saver = None
 	if TRAINING_MODE != 2:
 		pc_saver = tf.train.Saver(pc_variable)
 	if TRAINING_MODE != 1:
 		img_saver = tf.train.Saver(img_variable)
+		
 	
 	train_saver = {
 		'all_saver':all_saver,
@@ -338,14 +376,16 @@ def init_train_saver():
 	
 	return train_saver
 	
-def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
+def prepare_batch_data(pc_data,img_data,trans_data,feat_batch,ops,ep):
 	is_training = True
 	if TRAINING_MODE != 2:
 		feat_batch_pc = pc_data[feat_batch*BATCH_DATA_SIZE*FEAT_BARCH_SIZE:(feat_batch+1)*BATCH_DATA_SIZE*FEAT_BARCH_SIZE]
 	if TRAINING_MODE != 1:
 		feat_batch_img = img_data[feat_batch*BATCH_DATA_SIZE*FEAT_BARCH_SIZE:(feat_batch+1)*BATCH_DATA_SIZE*FEAT_BARCH_SIZE]
-	
-
+	if TRAINING_MODE == 3:
+		feat_batch_trans = trans_data[feat_batch*BATCH_DATA_SIZE*FEAT_BARCH_SIZE:(feat_batch+1)*BATCH_DATA_SIZE*FEAT_BARCH_SIZE]
+		
+		
 	if TRAINING_MODE == 1:
 		train_feed_dict = {
 		  ops["is_training_pl"]:is_training,
@@ -364,6 +404,7 @@ def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
 			ops["is_training_pl"]:is_training,
 			ops["img_placeholder"]:feat_batch_img,
 			ops["pc_placeholder"]:feat_batch_pc,
+			ops["trans_mat_placeholder"]:	feat_batch_trans,
 			ops["epoch_num_placeholder"]:ep}
 		return train_feed_dict
 		
@@ -371,7 +412,6 @@ def prepare_batch_data(pc_data,img_data,feat_batch,ops,ep):
 	exit()
 
 def train_one_step(sess,ops,train_feed_dict,train_writer):
-	global STEP
 	if TRAINING_MODE == 1:
 		summary,step,pc_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["pc_train_op"]],feed_dict = train_feed_dict)
 		print("batch num = %d , pc_loss = %f"%(step, pc_loss))
@@ -386,13 +426,8 @@ def train_one_step(sess,ops,train_feed_dict,train_writer):
 			print("batch num = %d , all_loss = %f"%(step, all_loss))
 		
 		else:
-			if STEP % 3 == 2:
-				summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["all_loss"],ops["fusion_train_op"]],feed_dict = train_feed_dict)
-				print("batch num = %d , all_loss = %f"%(step, all_loss))
-			else:
-				summary,step,pc_loss,img_loss,_,= sess.run([ops["merged"],ops["step"],ops["pc_loss"],ops["img_loss"],ops["pc_img_train_op"]],feed_dict = train_feed_dict)
-				print("batch num = %d , pc_loss = %f, img_loss = %f"%(step, pc_loss, img_loss))
-			STEP = step
+			summary,step,all_loss,_,= sess.run([ops["merged"],ops["step"],ops["all_loss"],ops["all_train_op"]],feed_dict = train_feed_dict)
+			print("batch num = %d , all_loss = %f"%(step, all_loss))
 			
 	#other training strategy
 	train_writer.add_summary(summary, step)
@@ -438,7 +473,7 @@ def get_load_batch_filename(load_batch_keys,quadruplet):
 			while True:
 				filename = "%s_mono_left.png"%(TRAINING_QUERIES[TRAINING_QUERIES[key]["positives"][cur_pos]]["query"][:-4])
 
-				if filename in img_files[9*(key_cnt)+1:9*(key_cnt)+1+i]:
+				if filename in img_files[BATCH_DATA_SIZE*(key_cnt)+1:BATCH_DATA_SIZE*(key_cnt)+1+i]:
 					cur_pos = cur_pos+1
 					continue
 				if os.path.exists(filename):
@@ -459,9 +494,9 @@ def get_load_batch_filename(load_batch_keys,quadruplet):
 					if is_negative(neg_ind,TRAINING_QUERIES[key]["not_negative"]):
 						break
 				
-				filename = "%s_mono_left.png"%(TRAINING_QUERIES[neg_ind]["query"][:-4])
 
-				if filename in img_files[9*(key_cnt)+1+POS_NUM:9*(key_cnt)+1+POS_NUM+i]:
+				filename = "%s_mono_left.png"%(TRAINING_QUERIES[neg_ind]["query"][:-4])
+				if filename in img_files[BATCH_DATA_SIZE*(key_cnt)+1+POS_NUM:BATCH_DATA_SIZE*(key_cnt)+1+POS_NUM+i]:
 					continue
 				if os.path.exists(filename):
 					break
@@ -521,7 +556,7 @@ def get_batch_keys(train_file_idxs,train_file_num):
 			CUR_LOAD = CUR_LOAD + 1
 			skip_num = skip_num + 1
 			continue
-			
+		
 		filename = "%s_mono_left.png"%(TRAINING_QUERIES[cur_key]["query"][:-4])
 		if not os.path.exists(filename):
 			#print(TRAINING_QUERIES[cur_key]["query"])
@@ -544,7 +579,76 @@ def get_batch_keys(train_file_idxs,train_file_num):
 		CUR_LOAD = CUR_LOAD + 1
 		
 	return False,load_batch_keys
+
+def cal_trans_data(pc_dict):
+	posfile = pc_dict[0]
+	pointcloud = pc_dict[1]
+	pointcloud = np.hstack([pointcloud, np.ones((pointcloud.shape[0],1))])
 	
+	imgpos = {}
+	with open(posfile) as imgpos_file:
+		for line in imgpos_file:
+			pos = [x for x in line.split(' ')]
+			for i in range(len(pos)-2):
+				pos[i+1] = float(pos[i+1])
+			imgpos[pos[0]] = np.reshape(np.array(pos[1:-1]),[4,4])
+	
+	#translate pointcloud to image coordinate
+	pointcloud = np.dot(np.linalg.inv(imgpos["mono_left"]),pointcloud.T)
+	pointcloud = np.dot(G_CAMERA_POSESOURCE, pointcloud)
+	uv = CAMERA_MODEL.project(pointcloud, [1024,1024])
+
+	lut = CAMERA_MODEL.bilinear_lut[:, 1::-1].T.reshape((2, 1024, 1024))
+	u = map_coordinates(lut[0, :, :], uv, order=1)
+	v = map_coordinates(lut[1, :, :], uv, order=1)
+	uv = np.array([u,v])
+	
+	zero0 = np.where(uv[1,:] == 0)
+	zero1 = np.where(uv[0,:] == 0)
+	zero_01 = np.intersect1d(zero0,zero1)
+	nozero = np.setdiff1d(np.arange(4096),zero_01)
+	uv = np.delete(uv,zero_01.tolist(),axis=1)
+	
+
+	transform_matrix = np.zeros([64*4096,1])
+	uv_tmp = np.rint(uv/128)
+	row = uv_tmp[1,:]*8 + uv_tmp[0,:]
+	row1 = (row*4096+nozero).astype(int).tolist()
+	transform_matrix[row1] = 1
+	transform_matrix = transform_matrix.reshape([64,4096])
+	'''
+	aa = np.sum(transform_matrix,1).reshape([8,8])
+	#aa[0,0] = 0
+	print(np.sum(aa))
+	plt.figure(1)
+	plt.imshow(aa.T)	
+	plt.figure(2)
+	plt.scatter(np.ravel(uv[0, :]), np.ravel(uv[1, :]), s=2, edgecolors='none', cmap='jet')
+	plt.xlim(0, 1024)
+	plt.ylim(1024, 0)
+	plt.xticks([])
+	plt.yticks([])
+	plt.show()'''
+	
+	return transform_matrix
+	
+	
+	
+def get_trans_datas(load_pc_filenames,pc_data,pool):
+	dict_list = []
+	for i in range(pc_data.shape[0]):
+		para = ("%s_imgpos.txt"%(load_pc_filenames[i][:-4]),pc_data[i,:,:])
+		#print(para_dict)
+		dict_list.append(para)
+	
+	'''
+	for i in range(len(dict_list)):
+		cal_trans_data(dict_list[i])
+	return
+	'''
+	trans_data = pool.map(cal_trans_data,dict_list)
+	return np.array(trans_data)
+
 def load_data(train_file_idxs):
 	global BATCH_REACH_END
 	global TRAINING_DATA
@@ -569,9 +673,11 @@ def load_data(train_file_idxs):
 		load_pc_filenames,load_img_filenames = get_load_batch_filename(load_batch_keys,quadruplet)
 		
 		#load pc&img data from file
-		#pc_data,img_data = load_img_pc_from_net(load_pc_filenames,load_img_filenames,pool)
-		pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool)
+		pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool)		
+		
+		trans_data = None
 		if TRAINING_MODE != 2:
+			trans_data = get_trans_datas(load_pc_filenames,pc_data,pool)
 			for i in range(len(pc_data)):
 				cur_pc = pc_data[i]
 				mean_cur_pc = cur_pc.mean(axis = 0)
@@ -579,8 +685,33 @@ def load_data(train_file_idxs):
 				mean_cur_pc = cur_pc.mean(axis = 0)
 				cur_pc = cur_pc - mean_cur_pc
 				pc_data[i] = cur_pc
+		
+		'''
+		for i in range(len(pc_data)):
+			cur_pc = pc_data[i]
+			print(cur_pc.mean(axis = 0))
+		exit()
+		#np.savetxt("hehe.txt",pc_data[0],delimiter=",",fmt="%.3f")
+		trans_data = np.array(trans_data)
+		print(trans_data.shape)
+		print(pc_data.shape)
+		print(img_data.shape)
+		
+		aa = np.sum(trans_data[0],1).reshape([8,8])
+		print(np.sum(aa))
+		plt.figure(1)
+		plt.imshow(aa.T)
+		plt.show()
+		'''
+		'''
+		for i in range(900):
+			np.savetxt("pc_%d.txt"%(i),pc_data[i,:,:],delimiter=" ",fmt = "%.3f")
+			cv2.imwrite("img_%d.png"%(i),np.squeeze(img_data[i,:,:,:]))
+			
+		exit()
+		'''
 		TRAINING_DATA_LOCK.acquire()
-		TRAINING_DATA.append([pc_data,img_data])
+		TRAINING_DATA.append([pc_data,img_data,trans_data])
 		TRAINING_DATA_LOCK.release()
 		
 		cnt = cnt + 1
@@ -631,12 +762,13 @@ def training(sess,train_saver,train_writer,ops):
 		TRAINING_DATA_LOCK.release()
 		pc_data = cur_batch_data[0]
 		img_data = cur_batch_data[1]
+		trans_data = cur_batch_data[2]
 		
 		print("consume one batch")
 	
 		for feat_batch in range(LOAD_FEAT_RATIO):
 			#prepare this batch data
-			train_feed_dict = prepare_batch_data(pc_data,img_data,feat_batch,ops,EP)
+			train_feed_dict = prepare_batch_data(pc_data,img_data,trans_data,feat_batch,ops,EP)
 											
 			#training
 			step = train_one_step(sess,ops,train_feed_dict,train_writer)
@@ -656,6 +788,9 @@ def main():
 	global BATCH_REACH_END
 	global EP
 	
+	#init_camera_model_posture
+	init_camera_model_posture()
+	
 	#init network pipeline
 	ops = init_pcainetwork()
 	
@@ -664,7 +799,7 @@ def main():
 
 	#init GPU
 	config = tf.ConfigProto()
-	config.gpu_options.allow_growth=True
+	config.gpu_options.allow_growth = True
 	
 	
 	#init tensorflow Session

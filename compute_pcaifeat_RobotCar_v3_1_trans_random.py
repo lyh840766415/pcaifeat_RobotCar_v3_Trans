@@ -1,12 +1,17 @@
 import numpy as np
 from loading_input_v3 import *
-from pointnetvlad_v3.pointnetvlad_cls import *
+from pointnetvlad_v3.pointnetvlad_trans import *
 import pointnetvlad_v3.loupe as lp
-import nets_v3.resnet_v1_50 as resnet
+import nets_v3.resnet_v1_trans as resnet
 import tensorflow as tf
 from time import *
 import pickle
 from multiprocessing.dummy import Pool as ThreadPool
+sys.path.append('/data/lyh/lab/robotcar-dataset-sdk/python')
+from camera_model import CameraModel
+from transform import build_se3_transform
+from image import load_image
+from scipy.ndimage import map_coordinates
 
 #thread pool
 pool = ThreadPool(10)
@@ -22,16 +27,40 @@ DATABASE_SETS= get_sets_dict(DATABASE_FILE)
 QUERY_SETS= get_sets_dict(QUERY_FILE)
 
 #model_path & image path
-PC_MODEL_PATH = ""
-IMG_MODEL_PATH = ""
-MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_cat_4/model_00606202.ckpt"
+PC_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_pc/pc_model_00174058.ckpt"
+IMG_MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_img/img_model_00174058.ckpt"
+MODEL_PATH = "/data/lyh/lab/pcaifeat_RobotCar_v3_1/log/train_save_trans_random/model_00348116.ckpt"
 
+#camera model and posture
+CAMERA_MODEL = None
+G_CAMERA_POSESOURCE = None
+
+def init_camera_model_posture():
+	global CAMERA_MODEL
+	global G_CAMERA_POSESOURCE
+	models_dir = "/data/lyh/lab/robotcar-dataset-sdk/models/"
+	CAMERA_MODEL = CameraModel(models_dir, "mono_left")
+	#read the camera and ins extrinsics
+	extrinsics_path = "/data/lyh/lab/robotcar-dataset-sdk/extrinsics/mono_left.txt"
+	print(extrinsics_path)
+	with open(extrinsics_path) as extrinsics_file:
+		extrinsics = [float(x) for x in next(extrinsics_file).split(' ')]
+	G_camera_vehicle = build_se3_transform(extrinsics)
+	print(G_camera_vehicle)
+	
+	extrinsics_path = "/data/lyh/lab/robotcar-dataset-sdk/extrinsics/ins.txt"
+	print(extrinsics_path)
+	with open(extrinsics_path) as extrinsics_file:
+		extrinsics = [float(x) for x in next(extrinsics_file).split(' ')]
+	G_ins_vehicle = build_se3_transform(extrinsics)
+	print(G_ins_vehicle)
+	G_CAMERA_POSESOURCE = G_camera_vehicle*G_ins_vehicle
 
 def output_to_file(output, filename):
 	with open(filename, 'wb') as handle:
 		pickle.dump(output, handle, protocol=pickle.HIGHEST_PROTOCOL)
 	print("Done ", filename)
-
+	
 def save_feat_to_file(database_feat,query_feat):
 	if TRAINING_MODE == 1:
 		output_to_file(database_feat["pc_feat"],"database_pc_feat_"+PC_MODEL_PATH[-13:-5]+".pickle")
@@ -56,25 +85,21 @@ def get_load_batch_filename(dict_to_process,batch_keys,edge = False,remind_index
 	if edge :
 		for i in range(BATCH_SIZE):
 			cur_index = min(remind_index-1,i)
-			pc_files.append(dict_to_process[batch_keys[cur_index]]["query"])
-				
+			pc_files.append(dict_to_process[batch_keys[cur_index]]["query"])			
 			img_files.append("%s_mono_left.png"%(dict_to_process[batch_keys[cur_index]]["query"][:-4]))
 	else:
 		for i in range(BATCH_SIZE):
 			pc_files.append(dict_to_process[batch_keys[i]]["query"])
 			img_files.append("%s_mono_left.png"%(dict_to_process[batch_keys[i]]["query"][:-4]))
-		
-	
-	
 	
 	if TRAINING_MODE == 1:
 		return pc_files,None
 	if TRAINING_MODE == 2:
 		return None,img_files
 	if TRAINING_MODE == 3:
-		return pc_files,img_files	
+		return pc_files,img_files
 
-def prepare_batch_data(pc_data,img_data,ops):
+def prepare_batch_data(pc_data,img_data,trans_data,ops):
 	is_training=False
 	if TRAINING_MODE == 1:
 		train_feed_dict = {
@@ -91,7 +116,8 @@ def prepare_batch_data(pc_data,img_data,ops):
 		train_feed_dict = {
 			ops["is_training_pl"]:is_training,
 			ops["img_placeholder"]:img_data,
-			ops["pc_placeholder"]:pc_data}
+			ops["pc_placeholder"]:pc_data,
+			ops["trans_mat_placeholder"]:trans_data}
 		return train_feed_dict
 		
 	print("prepare_batch_data_error,no_such train mode.")
@@ -140,8 +166,6 @@ def init_all_feat():
 	
 def concatnate_all_feat(all_feat,feat):
 	if TRAINING_MODE == 1:
-		print("all_feat ",all_feat["pc_feat"].shape)
-		print("feat ",feat["pc_feat"].shape)
 		all_feat["pc_feat"] = np.concatenate((all_feat["pc_feat"],feat["pc_feat"]),axis=0)
 	if TRAINING_MODE == 2:
 		all_feat["img_feat"] = np.concatenate((all_feat["img_feat"],feat["img_feat"]),axis=0)
@@ -149,7 +173,7 @@ def concatnate_all_feat(all_feat,feat):
 		all_feat["pc_feat"] = np.concatenate((all_feat["pc_feat"],feat["pc_feat"]),axis=0)
 		all_feat["img_feat"] = np.concatenate((all_feat["img_feat"],feat["img_feat"]),axis=0)
 		all_feat["pcai_feat"] = np.concatenate((all_feat["pcai_feat"],feat["pcai_feat"]),axis=0)
-	return all_feat			
+	return all_feat
 
 def get_unique_all_feat(all_feat,dict_to_process):
 	if TRAINING_MODE == 1:
@@ -161,7 +185,32 @@ def get_unique_all_feat(all_feat,dict_to_process):
 		all_feat["img_feat"] = all_feat["img_feat"][0:len(dict_to_process.keys()),:]	
 		all_feat["pcai_feat"] = all_feat["pcai_feat"][0:len(dict_to_process.keys()),:]			
 	return all_feat
-		
+
+def cal_trans_data(pc_dict):
+	posfile = pc_dict[0]
+	pointcloud = pc_dict[1]	
+	rand_ind = np.random.randint(64,size=4096)
+	arange_ind = np.arange(4096)
+	row = rand_ind*4096 + arange_ind
+	
+	transform_matrix = np.zeros([64*4096,1])
+	transform_matrix[row] = 1
+	transform_matrix = transform_matrix.reshape([64,4096])
+	
+	return transform_matrix
+	
+	
+def get_trans_datas(load_pc_filenames,pc_data,pool):
+	dict_list = []
+	for i in range(pc_data.shape[0]):
+		para = ("%s_imgpos.txt"%(load_pc_filenames[i][:-4]),pc_data[i,:,:])
+		#print(para_dict)
+		dict_list.append(para)
+	
+	trans_data = pool.map(cal_trans_data,dict_list)
+	return np.array(trans_data)
+
+
 def get_latent_vectors(sess,ops,dict_to_process):
 	print("dict_size = ",len(dict_to_process.keys()))
 	train_file_idxs = np.arange(0,len(dict_to_process.keys()))
@@ -182,19 +231,22 @@ def get_latent_vectors(sess,ops,dict_to_process):
 		
 		pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool)
 		
-		for i in range(len(pc_data)):
-			cur_pc = pc_data[i]
-			mean_cur_pc = cur_pc.mean(axis = 0)
-			cur_pc = cur_pc - mean_cur_pc
-			mean_cur_pc = cur_pc.mean(axis = 0)
-			cur_pc = cur_pc - mean_cur_pc
-			pc_data[i] = cur_pc
+		trans_data = None
+		if TRAINING_MODE != 2:
+			trans_data = get_trans_datas(load_pc_filenames,pc_data,pool)
+			for i in range(len(pc_data)):
+				cur_pc = pc_data[i]
+				mean_cur_pc = cur_pc.mean(axis = 0)
+				cur_pc = cur_pc - mean_cur_pc
+				mean_cur_pc = cur_pc.mean(axis = 0)
+				cur_pc = cur_pc - mean_cur_pc
+				pc_data[i] = cur_pc
 		
 		end_time = time()
 		
 		print ('load time ',end_time - begin_time)
 		
-		train_feed_dict = prepare_batch_data(pc_data,img_data,ops)
+		train_feed_dict = prepare_batch_data(pc_data,img_data,trans_data,ops)
 		
 		begin_time = time()
 		feat = train_one_step(sess,ops,train_feed_dict)
@@ -215,15 +267,20 @@ def get_latent_vectors(sess,ops,dict_to_process):
 	load_pc_filenames,load_img_filenames = get_load_batch_filename(dict_to_process,batch_keys,True,remind_index)
 	
 	pc_data,img_data = load_img_pc(load_pc_filenames,load_img_filenames,pool)
-	for i in range(len(pc_data)):
-		cur_pc = pc_data[i]
-		mean_cur_pc = cur_pc.mean(axis = 0)
-		cur_pc = cur_pc - mean_cur_pc
-		mean_cur_pc = cur_pc.mean(axis = 0)
-		cur_pc = cur_pc - mean_cur_pc
-		pc_data[i] = cur_pc
 	
-	train_feed_dict = prepare_batch_data(pc_data,img_data,ops)
+	trans_data = None
+	if TRAINING_MODE != 2:
+		trans_data = get_trans_datas(load_pc_filenames,pc_data,pool)
+		for i in range(len(pc_data)):
+			cur_pc = pc_data[i]
+			mean_cur_pc = cur_pc.mean(axis = 0)
+			cur_pc = cur_pc - mean_cur_pc
+			mean_cur_pc = cur_pc.mean(axis = 0)
+			cur_pc = cur_pc - mean_cur_pc
+			pc_data[i] = cur_pc
+
+	
+	train_feed_dict = prepare_batch_data(pc_data,img_data,trans_data,ops)
 	
 	feat = train_one_step(sess,ops,train_feed_dict)
 	
@@ -300,42 +357,40 @@ def get_bn_decay(step):
 	return bn_decay
 
 
-def init_imgnetwork():
+def init_imgnetwork(pc_trans_feat):
 	with tf.variable_scope("img_var"):
 		img_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,256,256,3])
-		img_feat_before_pooling, img_feat_after_pooling, body_prefix = resnet.endpoints(img_placeholder,is_training=False)
-		img_feat = tf.layers.dense(img_feat_after_pooling, EMBBED_SIZE,activation=tf.nn.relu)
-	return img_placeholder, img_feat_before_pooling, img_feat
+		img_feat, img_pc_feat = resnet.endpoints(img_placeholder,pc_trans_feat,is_training=False)
+	return img_placeholder, img_feat, img_pc_feat
 	
+
 def init_pcnetwork(step):
 	with tf.variable_scope("pc_var"):
 		pc_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,4096,3])
+		trans_mat_placeholder = tf.placeholder(tf.float32,shape=[BATCH_SIZE,64,4096])
 		is_training_pl = tf.placeholder(tf.bool, shape=())
 		bn_decay = get_bn_decay(step)
-		pc_feat_after_shape = pointnetvlad(pc_placeholder,is_training_pl,bn_decay)
-		pc_feat = tf.layers.dense(pc_feat_after_shape, EMBBED_SIZE,activation=tf.nn.relu)
-	return pc_placeholder,is_training_pl,pc_feat
-	
-	
+		pc_feat,pc_trans_feat = pointnetvlad(pc_placeholder,trans_mat_placeholder,is_training_pl,bn_decay)	
+	return pc_placeholder,is_training_pl,trans_mat_placeholder,pc_feat,pc_trans_feat
+
 def init_fusion_network(pc_feat,img_feat):
 	with tf.variable_scope("fusion_var"):
 		concat_feat = tf.concat((pc_feat,img_feat),axis=1)
 		pcai_feat = tf.layers.dense(concat_feat,EMBBED_SIZE,activation=tf.nn.relu)
-		print(pcai_feat)
 	return pcai_feat
-	
-	
+
 def init_pcainetwork():
 	#training step
 	step = tf.Variable(0)
-	
+	pc_trans_feat = None	
 	#init sub-network
 	if TRAINING_MODE != 2:
-		pc_placeholder, is_training_pl, pc_feat = init_pcnetwork(step)
+		pc_placeholder, is_training_pl, trans_mat_placeholder, pc_feat,pc_trans_feat = init_pcnetwork(step)
 	if TRAINING_MODE != 1:
-		img_placeholder, img_feat_before_pooling, img_feat = init_imgnetwork()
+		img_placeholder, img_feat, img_pc_feat = init_imgnetwork(pc_trans_feat)
+		img_feat = img_pc_feat
 	if TRAINING_MODE == 3:
-		pcai_feat = init_fusion_network(pc_feat,img_feat)
+		pcai_feat = init_fusion_network(pc_feat,img_pc_feat)
 		
 		
 	#output of pcainetwork init
@@ -357,6 +412,7 @@ def init_pcainetwork():
 			"is_training_pl":is_training_pl,
 			"pc_placeholder":pc_placeholder,
 			"img_placeholder":img_placeholder,
+			"trans_mat_placeholder":trans_mat_placeholder,
 			"pc_feat":pc_feat,
 			"img_feat":img_feat,
 			"pcai_feat":pcai_feat}
@@ -364,6 +420,8 @@ def init_pcainetwork():
 		
 		
 def init_network_variable(sess,train_saver):
+	sess.run(tf.global_variables_initializer())
+	
 	if TRAINING_MODE == 1:
 		train_saver['pc_saver'].restore(sess,PC_MODEL_PATH)
 		print("pc_model restored")
@@ -386,8 +444,19 @@ def init_train_saver():
 	pc_variable = [v for v in variables if v.name.split('/')[0] =='pc_var']
 	img_variable = [v for v in variables if v.name.split('/')[0] =='img_var']
 	
-	pc_saver = tf.train.Saver(pc_variable)
-	img_saver = tf.train.Saver(img_variable)
+	'''
+	other_var = pc_variable = [v for v in variables if v.name.split('/')[0] !='pc_var']
+	for var in other_var:
+		print(var)
+	exit()
+	'''
+	
+	pc_saver = None
+	img_saver = None
+	if TRAINING_MODE != 2:
+		pc_saver = tf.train.Saver(pc_variable)
+	if TRAINING_MODE != 1:
+		img_saver = tf.train.Saver(img_variable)
 	
 	train_saver = {
 		'all_saver':all_saver,
@@ -398,6 +467,9 @@ def init_train_saver():
 	
 
 def main():
+	#init_camera_model_posture
+	init_camera_model_posture()
+	
 	#init network pipeline
 	ops = init_pcainetwork()
 	

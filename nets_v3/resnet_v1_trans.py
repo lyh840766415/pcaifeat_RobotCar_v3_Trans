@@ -12,7 +12,7 @@ def endpoints(image,pc_trans_feat,is_training):
 	
 	with tf.contrib.slim.arg_scope(resnet_arg_scope(batch_norm_decay=0.9, weight_decay=0.0)):
 		_, endpoints = resnet_v1_50(image, num_classes=None, is_training=is_training, global_pool=True)
-		
+	
 	if not pc_trans_feat is None:
 		concat_feat = tf.concat((endpoints['img_var/resnet_v1_50/block4'],pc_trans_feat),axis=3)
 		conv_feat = tf.layers.conv2d(concat_feat,2048,3,activation=tf.nn.relu)
